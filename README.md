@@ -49,8 +49,29 @@ For Hindi use `large-v3-turbo` + `--language hi`. Never leave the language on `a
 use. If Colab says "No backend with GPU available", try a personal Gmail account rather than a
 work/organization account, or use `kaggle_gpu_server.ipynb`.
 
+## English: Parakeet (more accurate than Whisper, much faster)
+
+`parakeet_server.py` + `parakeet_ui.html` run NVIDIA **Parakeet TDT 0.6B v2** (English only)
+through [onnx-asr](https://pypi.org/project/onnx-asr/), with Silero VAD to find pauses.
+Each sentence is transcribed whole once you pause (Parakeet is an offline model and loses
+accuracy on fixed chunks); grey text is a live preview while you speak.
+
+On a free Colab GPU:
+https://colab.research.google.com/github/kunalost/whisper/blob/main/colab_parakeet.ipynb
+
+It is fast enough to run on a CPU too (int8, ~6x realtime on a 12-thread laptop):
+
+```powershell
+venv\Scripts\python.exe -m pip install "onnx-asr[cpu,hub]" fastapi uvicorn
+venv\Scripts\python.exe parakeet_server.py --device cpu --quantization int8
+```
+
+Then open http://localhost:8000. `python parakeet_server.py --help` lists the tuning
+options (pause length, max sentence length, VAD thresholds).
+
 ## Files
 
+- `parakeet_server.py` / `parakeet_ui.html` / `colab_parakeet.ipynb` - Parakeet English server, its web page, and the Colab notebook.
 - `start_server.ps1` - starts the server (auto-detects CUDA, device/model/language options).
 - `colab_gpu_server.ipynb` / `kaggle_gpu_server.ipynb` - run the server on a free cloud GPU behind an HTTPS tunnel.
 - `run_wlk.py` - launcher that forces faster-whisper device/compute type (WhisperLiveKit hardcodes `auto`).

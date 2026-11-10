@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parakeet Live</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1b1b1b; --muted: #6b6b6b;
+    --line: #e4e4e0; --accent: #2f6fed; --rec: #d64545; --ok: #2e8b57; --warn: #b7791f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151515; --panel: #1f1f1f; --text: #ececec; --muted: #9a9a9a;
+            --line: #333; --accent: #6b9bff; --rec: #ff6b6b; --ok: #5ccf8f; --warn: #e0b050; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 40px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 600; }
+  .chip { font-size: 13px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line);
+          color: var(--muted); background: var(--panel); }
+  .chip.ok { color: var(--ok); border-color: currentColor; }
+  .chip.warn { color: var(--warn); border-color: currentColor; }
+  .controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+           border-radius: 10px; padding: 8px 14px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #rec { background: var(--accent); color: #fff; border-color: transparent; min-width: 120px; font-weight: 600; }
+  #rec.on { background: var(--rec); }
+  .meter { flex: 1 1 140px; min-width: 120px; height: 10px; background: var(--line); border-radius: 999px; overflow: hidden; }
+  .meter > div { height: 100%; width: 0%; background: var(--ok); transition: width 80ms linear; }
+  #transcript { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px;
+                min-height: 260px; max-height: 62vh; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word; }
+  #transcript .final { }
+  #transcript .partial { color: var(--muted); }
+  #transcript .hint { color: var(--muted); font-style: italic; }
+  .stats { margin-top: 10px; font-size: 13px; color: var(--muted); display: flex; gap: 16px; flex-wrap: wrap; }
+  #status { margin-top: 6px; font-size: 14px; color: var(--muted); min-height: 1.4em; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Parakeet Live</h1>
+    <span id="model" class="chip">connecting...</span>
+  </header>
+
+  <div class="controls">
+    <button id="rec">Start</button>
+    <div class="meter" title="Microphone level"><div id="level"></div></div>
+    <button id="copy">Copy</button>
+    <button id="clear">Clear</button>
+  </div>
+
+  <div id="transcript"><span class="hint">Press Start and speak. Text is finalized at each pause.</span></div>
+  <div class="stats">
+    <span id="s-final">last sentence: -</span>
+    <span id="s-preview">live preview: -</span>
+  </div>
+  <div id="status"></div>
+</main>
+
+<!-- AudioWorklet: converts mic audio to 16 kHz mono PCM16 and posts ~100 ms per message.
+     Sending every 128-frame render quantum separately floods the socket, so we buffer. -->
+<script type="text/plain" id="worklet-src">
+class Pcm16Sender extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.target = options.processorOptions.targetRate;
+    this.ratio = sampleRate / this.target;          // 1 when the context already runs at 16 kHz
+    this.chunk = Math.round(this.target / 10);      // 100 ms
+    this.buf = new Int16Array(this.chunk);
+    this.n = 0;
+    this.acc = 0; this.accCount = 0; this.phase = 0;
+    this.sumSq = 0;
+  }
+  emit(s) {
+    if (s > 1) s = 1; else if (s < -1) s = -1;
+    this.sumSq += s * s;
+    this.buf[this.n++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    if (this.n === this.chunk) {
+      const rms = Math.sqrt(this.sumSq / this.chunk);
+      const out = this.buf.slice(0);
+      this.port.postMessage({ pcm: out.buffer, rms: rms }, [out.buffer]);
+      this.n = 0; this.sumSq = 0;
+    }
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) {
+      if (this.ratio === 1) {
+        for (let i = 0; i < ch.length; i++) this.emit(ch[i]);
+      } else {
+        // Fallback resampler (only used if the browser refused a 16 kHz context):
+        // average the input samples that fall into each output sample.
+        for (let i = 0; i < ch.length; i++) {
+          this.acc += ch[i]; this.accCount++; this.phase += 1;
+          if (this.phase >= this.ratio) {
+            this.emit(this.acc / this.accCount);
+            this.acc = 0; this.accCount = 0; this.phase -= this.ratio;
+          }
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('pcm16-sender', Pcm16Sender);
+</script>
+
+<script>
+const SR = 16000;
+const $ = (id) => document.getElementById(id);
+const recBtn = $("rec"), transcript = $("transcript"), statusEl = $("status"), modelChip = $("model");
+
+let ws = null, ctx = null, stream = null, node = null, recording = false;
+let finals = [];           // finalized sentences
+let partial = "";          // live preview of the current sentence
+
+function wsUrl() {
+  return (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/asr";
+}
+
+function render() {
+  transcript.textContent = "";
+  if (!finals.length && !partial) {
+    const h = document.createElement("span");
+    h.className = "hint";
+    h.textContent = recording ? "Listening..." : "Press Start and speak. Text is finalized at each pause.";
+    transcript.appendChild(h);
+    return;
+  }
+  if (finals.length) {
+    const f = document.createElement("span");
+    f.className = "final";
+    f.textContent = finals.join(" ");
+    transcript.appendChild(f);
+  }
+  if (partial) {
+    const p = document.createElement("span");
+    p.className = "partial";
+    p.textContent = (finals.length ? " " : "") + partial;
+    transcript.appendChild(p);
+  }
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function setStatus(msg) { statusEl.textContent = msg || ""; }
+
+function connect() {
+  return new Promise((resolve, reject) => {
+    const sock = new WebSocket(wsUrl());
+    sock.binaryType = "arraybuffer";
+    sock.onopen = () => resolve(sock);
+    sock.onerror = () => reject(new Error("Could not connect to the server at " + wsUrl()));
+    sock.onclose = () => {
+      if (recording) { setStatus("Connection to the server was lost."); stop(true); }
+    };
+    sock.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.type === "ready") {
+        modelChip.textContent = m.model.replace("nemo-", "") + " · " + m.device;
+        modelChip.className = "chip " + (m.device.startsWith("GPU") ? "ok" : "warn");
+      } else if (m.type === "partial") {
+        partial = m.text;
+        $("s-preview").textContent = "live preview: " + m.ms + " ms";
+        render();
+      } else if (m.type === "final") {
+        if (m.text) finals.push(m.text);
+        partial = "";
+        if (m.audio_s) $("s-final").textContent =
+          "last sentence: " + m.audio_s.toFixed(1) + " s of audio in " + m.ms + " ms";
+        render();
+      } else if (m.type === "flushed") {
+        sock.dispatchEvent(new Event("flushed"));
+      }
+    };
+  });
+}
+
+async function start() {
+  setStatus("");
+  recBtn.disabled = true;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    ws = await connect();
+
+    // Ask the browser to resample to 16 kHz for us (best quality). Some browsers
+    // (Firefox) refuse a mic source in a context with a different rate; fall back.
+    let src;
+    try {
+      ctx = new AudioContext({ sampleRate: SR });
+      src = ctx.createMediaStreamSource(stream);
+    } catch (e) {
+      if (ctx) ctx.close();
+      ctx = new AudioContext();
+      src = ctx.createMediaStreamSource(stream);
+    }
+    if (ctx.state === "suspended") await ctx.resume();
+
+    const code = $("worklet-src").textContent;
+    const url = URL.createObjectURL(new Blob([code], { type: "application/javascript" }));
+    await ctx.audioWorklet.addModule(url);
+    node = new AudioWorkletNode(ctx, "pcm16-sender", {
+      numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+      processorOptions: { targetRate: SR },
+    });
+
+    // Chrome only renders nodes that lead to the destination. Route through a muted
+    // gain so the worklet keeps running without playing your voice back.
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    src.connect(node);
+    node.connect(sink);
+    sink.connect(ctx.destination);
+
+    node.port.onmessage = (e) => {
+      $("level").style.width = Math.min(100, e.data.rms * 400) + "%";
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data.pcm);
+    };
+
+    recording = true;
+    partial = "";
+    recBtn.textContent = "Stop";
+    recBtn.classList.add("on");
+    render();
+  } catch (err) {
+    console.error(err);
+    const insecure = !window.isSecureContext;
+    setStatus(insecure
+      ? "Microphone needs a secure page: open the https:// link (or localhost)."
+      : (err && err.name === "NotAllowedError")
+        ? "Microphone permission was blocked. Allow it in the address bar and press Start again."
+        : (err && err.message) || String(err));
+    await cleanup();
+  } finally {
+    recBtn.disabled = false;
+  }
+}
+
+async function cleanup() {
+  if (node) { node.port.onmessage = null; node.disconnect(); node = null; }
+  if (ctx) { try { await ctx.close(); } catch {} ctx = null; }
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  $("level").style.width = "0%";
+}
+
+async function stop(lost) {
+  if (!recording) return;
+  recording = false;
+  recBtn.disabled = true;
+  await cleanup();                 // stop sending audio first
+  const sock = ws; ws = null;
+  if (sock && sock.readyState === WebSocket.OPEN && !lost) {
+    // Ask the server to finish the sentence in progress before we hang up.
+    setStatus("Finishing the last sentence...");
+    await new Promise((resolve) => {
+      const t = setTimeout(resolve, 5000);
+      sock.addEventListener("flushed", () => { clearTimeout(t); resolve(); }, { once: true });
+      sock.send("flush");
+    });
+    sock.close();
+    setStatus("");
+  }
+  partial = "";
+  recBtn.textContent = "Start";
+  recBtn.classList.remove("on");
+  recBtn.disabled = false;
+  render();
+}
+
+recBtn.onclick = () => (recording ? stop(false) : start());
+$("clear").onclick = () => { finals = []; partial = ""; render(); };
+$("copy").onclick = async () => {
+  const text = finals.join(" ");
+  try { await navigator.clipboard.writeText(text); setStatus("Copied."); }
+  catch { setStatus("Copy failed - select the text and press Ctrl+C."); }
+  setTimeout(() => setStatus(""), 1500);
+};
+
+// Show model/device before the first recording.
+fetch("health").then((r) => r.json()).then((h) => {
+  modelChip.textContent = h.model.replace("nemo-", "") + " · " + h.device;
+  modelChip.className = "chip " + (h.device.startsWith("GPU") ? "ok" : "warn");
+}).catch(() => { modelChip.textContent = "server not reachable"; });
+</script>
+</body>
+</html>
