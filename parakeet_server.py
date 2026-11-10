@@ -60,6 +60,39 @@ def pick_providers(device: str) -> list:
     return ["CPUExecutionProvider"]
 
 
+# Hugging Face repos behind the onnx-asr model names we use.
+HF_REPOS = {
+    "nemo-parakeet-tdt-0.6b-v2": "istupakov/parakeet-tdt-0.6b-v2-onnx",
+    "nemo-parakeet-tdt-0.6b-v3": "istupakov/parakeet-tdt-0.6b-v3-onnx",
+}
+
+
+def download_model(model: str, quantization: str | None) -> str | None:
+    """Download into a plain folder of real files and return its path.
+
+    The full-precision encoder is >2 GB, so it ships as encoder-model.onnx plus a
+    separate encoder-model.onnx.data. The default Hugging Face cache stores files as
+    symlinks into a blobs/ folder on Linux, and onnxruntime >= 1.2x refuses external
+    data reached through a link that points outside the model's folder:
+    "External data path validation failed". A local_dir download avoids that.
+    """
+    repo = HF_REPOS.get(model)
+    if repo is None:
+        return None   # unknown name: let onnx-asr resolve it itself
+    from huggingface_hub import snapshot_download
+
+    if quantization == "int8":
+        weights = ["encoder-model.int8.onnx", "decoder_joint-model.int8.onnx"]
+    else:
+        weights = ["encoder-model.onnx", "encoder-model.onnx.data", "decoder_joint-model.onnx"]
+    cache = pathlib.Path(os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache"))
+    local = cache / "parakeet_server" / "models" / repo.replace("/", "--")
+    log.info("downloading %s (%s) -> %s", repo, quantization or "full precision", local)
+    snapshot_download(repo, local_dir=str(local),
+                      allow_patterns=["config.json", "vocab.txt", "nemo128.onnx", *weights])
+    return str(local)
+
+
 def session_providers(obj, depth=0, seen=None) -> list:
     """Find the providers the loaded onnxruntime sessions actually ended up using."""
     seen = seen if seen is not None else set()
@@ -169,9 +202,10 @@ def build_app(cfg) -> FastAPI:
     import onnx_asr
 
     providers = pick_providers(cfg.device)
-    log.info("loading %s (quantization=%s) with %s", cfg.model, cfg.quantization, providers)
     t = time.time()
-    model = onnx_asr.load_model(cfg.model, quantization=cfg.quantization, providers=providers)
+    path = cfg.model_dir or download_model(cfg.model, cfg.quantization)
+    log.info("loading %s (quantization=%s) from %s with %s", cfg.model, cfg.quantization, path, providers)
+    model = onnx_asr.load_model(cfg.model, path, quantization=cfg.quantization, providers=providers)
     load_s = time.time() - t
     used = session_providers(model) or providers
     vad_session = load_vad_session()
@@ -303,6 +337,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="nemo-parakeet-tdt-0.6b-v2", help="onnx-asr model name (English: nemo-parakeet-tdt-0.6b-v2)")
     ap.add_argument("--quantization", default=None, help="None (full precision) or int8 (smaller, faster on CPU)")
+    ap.add_argument("--model-dir", default=None, help="load model files from this folder instead of downloading")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
