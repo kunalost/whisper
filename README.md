@@ -37,9 +37,22 @@ Then open http://localhost:8000 and allow the microphone.
 
 Defaults are chosen per device: `large-v3` + `int8_float16` on GPU, `base` + `int8` on CPU.
 
+## Run on a free cloud GPU (Colab / Kaggle)
+
+No local GPU? Open the notebook in Colab, set **Runtime -> Change runtime type -> T4 GPU**,
+and run the cells in order. The last cell prints an `https://...trycloudflare.com` link to open.
+
+https://colab.research.google.com/github/kunalost/whisper/blob/main/colab_gpu_server.ipynb
+
+Tested defaults on a T4: `distil-large-v3` + `--language en` (English, keeps up in real time).
+For Hindi use `large-v3-turbo` + `--language hi`. Never leave the language on `auto` for live
+use. If Colab says "No backend with GPU available", try a personal Gmail account rather than a
+work/organization account, or use `kaggle_gpu_server.ipynb`.
+
 ## Files
 
 - `start_server.ps1` - starts the server (auto-detects CUDA, device/model/language options).
+- `colab_gpu_server.ipynb` / `kaggle_gpu_server.ipynb` - run the server on a free cloud GPU behind an HTTPS tunnel.
 - `run_wlk.py` - launcher that forces faster-whisper device/compute type (WhisperLiveKit hardcodes `auto`).
 - `patch_webui.py` - fixes the browser mic capture path (required, see below).
 - `realtime.py` - standalone terminal mic transcription script (no browser).
